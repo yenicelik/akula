@@ -11,6 +11,8 @@ pub enum PenaltyKind {
     InvalidSeal,
     TooFarFuture,
     TooFarPast,
+    MalformedTransaction,
+    MalformedTransactionHash,
 }
 
 #[derive(Debug, Clone)]

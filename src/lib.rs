@@ -43,6 +43,7 @@ pub mod stagedsync;
 pub mod stages;
 mod state;
 pub mod trie;
+pub mod txpool;
 pub(crate) mod util;
 
 pub use stagedsync::stages::StageId;
