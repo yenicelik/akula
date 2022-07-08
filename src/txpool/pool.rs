@@ -11,6 +11,7 @@ use crate::{
     TaskGuard,
 };
 use arrayvec::ArrayVec;
+use dashmap::DashMap;
 use hashbrown::HashMap;
 use hashlink::LruCache;
 use parking_lot::Mutex;
@@ -24,16 +25,18 @@ use tracing::*;
 pub const PER_SENDER: usize = 32;
 pub type TransactionList<T = Transaction> = ArrayVec<T, PER_SENDER>;
 
+pub struct SharedState {}
+
 pub struct Pool {
-    node: Arc<Node>,
+    pub node: Arc<Node>,
 
-    by_hash: HashMap<H256, Transaction>,
-    by_sender: HashMap<H160, TransactionList>,
+    pub by_hash: DashMap<H256, Transaction>,
+    pub by_sender: HashMap<H160, TransactionList>,
 
-    unprocessed: Mutex<LruCache<Transaction, ()>>,
+    pub unprocessed: Mutex<LruCache<Transaction, ()>>,
 
-    worst_queue: (),
-    best_queue: (),
+    pub worst_queue: (),
+    pub best_queue: (),
 }
 
 impl Pool {
@@ -88,11 +91,38 @@ impl Pool {
             }
         });
 
-        tasks.spawn_with_name("incoming router", {
-            let pool = self.clone();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(128);
+        tasks.spawn({
+            let this = self.clone();
 
             async move {
-                let mut stream = pool.node.stream_transactions().await;
+                while let Some((GetPooledTransactions { request_id, hashes }, peer_id, sentry_id)) =
+                    inbound_rx.recv().await
+                {
+                    let transactions = hashes
+                        .iter()
+                        .filter_map(|hash| {
+                            this.by_hash
+                                .get(hash)
+                                .map(|shared_ref| shared_ref.clone().msg)
+                        })
+                        .collect::<Vec<_>>();
+                    this.node
+                        .send_pooled_transactions(
+                            request_id,
+                            transactions,
+                            PeerFilter::Peer(peer_id, sentry_id),
+                        )
+                        .await;
+                }
+            }
+        });
+
+        tasks.spawn_with_name("incoming router", {
+            let this = self.clone();
+
+            async move {
+                let mut stream = this.node.stream_transactions().await;
 
                 while let Some(InboundMessage {
                     msg,
@@ -109,10 +139,12 @@ impl Pool {
                         Message::Transactions(Transactions(transactions)) => {
                             match transactions
                                 .into_iter()
-                                .map(Transaction::try_from)
+                                .map(|msg| Transaction::try_from(msg).map(|tx| (tx, ())))
                                 .collect::<Result<Vec<_>, _>>()
                             {
-                                Ok(_) => todo!(),
+                                Ok(transactions) => {
+                                    this.unprocessed.lock().extend(transactions);
+                                }
                                 Err(_) => {
                                     penalty_tx
                                         .send((peer_id, PenaltyKind::MalformedTransaction))
@@ -120,16 +152,20 @@ impl Pool {
                                 }
                             }
                         }
-                        Message::GetPooledTransactions(GetPooledTransactions { .. }) => todo!(),
+                        Message::GetPooledTransactions(request) => {
+                            inbound_tx.send((request, peer_id, sentry_id)).await?;
+                        }
                         Message::PooledTransactions(PooledTransactions {
                             transactions, ..
                         }) => {
                             match transactions
                                 .into_iter()
-                                .map(Transaction::try_from)
+                                .map(|msg| Transaction::try_from(msg).map(|tx| (tx, ())))
                                 .collect::<Result<Vec<_>, _>>()
                             {
-                                Ok(_) => todo!(),
+                                Ok(transactions) => {
+                                    this.unprocessed.lock().extend(transactions);
+                                }
                                 Err(_) => {
                                     penalty_tx
                                         .send((peer_id, PenaltyKind::MalformedTransaction))
