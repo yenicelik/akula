@@ -78,6 +78,32 @@ where
     Ok(d)
 }
 
+pub mod collections {
+    pub struct Buffer<T: Clone> {
+        inner: Vec<T>,
+        capacity: usize,
+    }
+
+    impl<T: Clone> Buffer<T> {
+        pub fn new(capacity: usize) -> Self {
+            Self {
+                inner: Vec::with_capacity(capacity),
+                capacity,
+            }
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn push(&mut self, item: T) {
+            if self.inner.len() < self.capacity {
+                self.inner.push(item);
+            }
+        }
+    }
+}
+
 pub mod akula_tracing {
     use tracing::Subscriber;
     use tracing_subscriber::{prelude::*, EnvFilter};

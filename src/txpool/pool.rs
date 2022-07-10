@@ -1,5 +1,5 @@
 use crate::{
-    models::{H160, H256},
+    kv::{mdbx::MdbxTransaction, tables, MdbxWithDirHandle},
     p2p::{
         node::Node,
         types::{
@@ -10,40 +10,74 @@ use crate::{
     txpool::{types::*, PoolBuilder},
     TaskGuard,
 };
-use arrayvec::ArrayVec;
-use dashmap::DashMap;
-use hashbrown::HashMap;
-use hashlink::LruCache;
+use mdbx::{WriteMap, RO};
 use parking_lot::Mutex;
 use rand::Rng;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use task_group::TaskGroup;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::*;
 
 pub const PER_SENDER: usize = 32;
-pub type TransactionList<T = Transaction> = ArrayVec<T, PER_SENDER>;
 
-pub struct SharedState {}
+pub type Score = usize;
+
+#[derive(Default)]
+pub struct SharedState {
+    lookup: TransactionLookup,
+
+    best_queue: BTreeSet<Score>,
+    worst_queue: BTreeSet<Score>,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_transaction<'env, 'txn>(
+        &mut self,
+        txn: &'txn MdbxTransaction<'env, RO, WriteMap>,
+        tx: Transaction,
+    ) -> anyhow::Result<()>
+    where
+        'env: 'txn,
+    {
+        if self.lookup.contains_hash(tx.hash) {
+            return Ok(());
+        }
+
+        let account = txn.get(tables::Account, tx.sender)?.unwrap_or_default();
+        if account.nonce > tx.nonce() {
+            // Just ignore this transaction if the sender's nonce is higher than the transaction's nonce.
+            return Ok(());
+        };
+
+        account.balance;
+
+        // TODO: check sender's balance.
+
+        self.lookup.insert(tx);
+
+        Ok(())
+    }
+}
 
 pub struct Pool {
     pub node: Arc<Node>,
+    pub db: Arc<MdbxWithDirHandle<WriteMap>>,
 
-    pub by_hash: DashMap<H256, Transaction>,
-    pub by_sender: HashMap<H160, TransactionList>,
-
-    pub unprocessed: Mutex<LruCache<Transaction, ()>>,
-
-    pub worst_queue: (),
-    pub best_queue: (),
+    state: Arc<Mutex<SharedState>>,
 }
 
 impl Pool {
     pub fn builder() -> PoolBuilder {
         PoolBuilder::default()
     }
+}
 
+impl Pool {
     pub async fn run(self: Arc<Self>) {
         let tasks = TaskGroup::new();
 
@@ -99,22 +133,41 @@ impl Pool {
                 while let Some((GetPooledTransactions { request_id, hashes }, peer_id, sentry_id)) =
                     inbound_rx.recv().await
                 {
-                    let transactions = hashes
-                        .iter()
-                        .filter_map(|hash| {
-                            this.by_hash
-                                .get(hash)
-                                .map(|shared_ref| shared_ref.clone().msg)
-                        })
-                        .collect::<Vec<_>>();
-                    this.node
-                        .send_pooled_transactions(
-                            request_id,
-                            transactions,
-                            PeerFilter::Peer(peer_id, sentry_id),
-                        )
-                        .await;
+                    todo!()
+                    // let transactions = hashes
+                    //     .iter()
+                    //     .filter_map(|hash| {
+                    //         this.by_hash
+                    //             .get(hash)
+                    //             .map(|shared_ref| shared_ref.clone().msg)
+                    //     })
+                    //     .collect::<Vec<_>>();
+                    // this.node
+                    //     .send_pooled_transactions(
+                    //         request_id,
+                    //         transactions,
+                    //         PeerFilter::Peer(peer_id, sentry_id),
+                    //     )
+                    //     .await;
                 }
+            }
+        });
+
+        let (processor_tx, mut processor_rx) = mpsc::channel(128);
+        tasks.spawn({
+            let this = self.clone();
+
+            async move {
+                while let Some(transactions) = processor_rx.recv().await {
+                    let txn = this.db.begin()?;
+                    let mut shared_state = this.state.lock();
+
+                    for transaction in transactions {
+                        SharedState::add_transaction(&mut shared_state, &txn, transaction);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>(())
             }
         });
 
@@ -136,14 +189,16 @@ impl Pool {
                                 .send((hashes, PeerFilter::Peer(peer_id, sentry_id)))
                                 .await?;
                         }
-                        Message::Transactions(Transactions(transactions)) => {
+                        Message::Transactions(Transactions(transactions))
+                            if !transactions.is_empty() =>
+                        {
                             match transactions
                                 .into_iter()
-                                .map(|msg| Transaction::try_from(msg).map(|tx| (tx, ())))
+                                .map(Transaction::try_from)
                                 .collect::<Result<Vec<_>, _>>()
                             {
                                 Ok(transactions) => {
-                                    this.unprocessed.lock().extend(transactions);
+                                    processor_tx.send(transactions).await?;
                                 }
                                 Err(_) => {
                                     penalty_tx
@@ -160,11 +215,11 @@ impl Pool {
                         }) => {
                             match transactions
                                 .into_iter()
-                                .map(|msg| Transaction::try_from(msg).map(|tx| (tx, ())))
+                                .map(Transaction::try_from)
                                 .collect::<Result<Vec<_>, _>>()
                             {
                                 Ok(transactions) => {
-                                    this.unprocessed.lock().extend(transactions);
+                                    processor_tx.send(transactions).await?;
                                 }
                                 Err(_) => {
                                     penalty_tx
@@ -173,7 +228,7 @@ impl Pool {
                                 }
                             }
                         }
-                        _ => unreachable!(),
+                        _ => {}
                     }
                 }
 
@@ -182,9 +237,29 @@ impl Pool {
         });
 
         tasks.spawn({
-            let _this = self.node.clone();
+            let this = self.clone();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
-            async move {}
+            async move {
+                tokio::select! {
+                    _ = ticker.tick() => {
+
+                        // let unprocessed = this.unprocessed.lock().drain().collect::<Vec<_>>();
+                        // for (tx, _) in unprocessed {
+                        //     this.by_sender.entry(tx.sender).or_default().map(|list| {
+                        //         if list.is_full() {
+                        //             list.clear();
+                        //         }
+                        //         list.push(tx);
+                        //         list
+                        //     });
+                        //     this.by_hash.insert(tx.hash, tx);
+
+
+                        // }
+                    }
+                }
+            }
         });
 
         std::future::pending::<()>().await;
