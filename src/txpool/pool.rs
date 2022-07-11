@@ -1,5 +1,7 @@
+#![allow(unreachable_code)]
 use crate::{
     kv::{mdbx::MdbxTransaction, tables, MdbxWithDirHandle},
+    models::{MessageWithSignature, U256},
     p2p::{
         node::Node,
         types::{
@@ -10,58 +12,29 @@ use crate::{
     txpool::{types::*, PoolBuilder},
     TaskGuard,
 };
-use mdbx::{WriteMap, RO};
+use derive_more::Display;
+use mdbx::{EnvironmentKind, TransactionKind, WriteMap, RO};
 use parking_lot::Mutex;
 use rand::Rng;
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
+};
 use task_group::TaskGroup;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::*;
 
 pub const PER_SENDER: usize = 32;
 
-pub type Score = usize;
-
 #[derive(Default)]
 pub struct SharedState {
     lookup: TransactionLookup,
 
-    best_queue: BTreeSet<Score>,
-    worst_queue: BTreeSet<Score>,
-}
-
-impl SharedState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn add_transaction<'env, 'txn>(
-        &mut self,
-        txn: &'txn MdbxTransaction<'env, RO, WriteMap>,
-        tx: Transaction,
-    ) -> anyhow::Result<()>
-    where
-        'env: 'txn,
-    {
-        if self.lookup.contains_hash(tx.hash) {
-            return Ok(());
-        }
-
-        let account = txn.get(tables::Account, tx.sender)?.unwrap_or_default();
-        if account.nonce > tx.nonce() {
-            // Just ignore this transaction if the sender's nonce is higher than the transaction's nonce.
-            return Ok(());
-        };
-
-        account.balance;
-
-        // TODO: check sender's balance.
-
-        self.lookup.insert(tx);
-
-        Ok(())
-    }
+    best_queue: BTreeSet<ScoredTransaction>,
+    worst_queue: BTreeSet<ScoredTransaction>,
 }
 
 pub struct Pool {
@@ -69,11 +42,65 @@ pub struct Pool {
     pub db: Arc<MdbxWithDirHandle<WriteMap>>,
 
     state: Arc<Mutex<SharedState>>,
+
+    min_priority_fee: U256,
 }
 
 impl Pool {
     pub fn builder() -> PoolBuilder {
         PoolBuilder::default()
+    }
+}
+
+impl Pool {
+    pub fn add_transaction<'env, 'txn>(
+        &self,
+        shared_state: &mut SharedState,
+        txn: &'txn MdbxTransaction<'env, RO, WriteMap>,
+        tx: Transaction,
+        current_base_fee: U256,
+    ) -> anyhow::Result<InsertionStatus>
+    where
+        'env: 'txn,
+    {
+        if shared_state.lookup.contains_hash(&tx.hash) {
+            return Ok(InsertionStatus::Discarded(DiscardReason::AlreadyKnown));
+        };
+
+        let account = txn.get(tables::Account, tx.sender)?.unwrap_or_default();
+        if account.nonce > tx.nonce() {
+            return Ok(InsertionStatus::Discarded(DiscardReason::NonceTooLow));
+        };
+        if account.balance < tx.total_price() {
+            return Ok(InsertionStatus::Discarded(
+                DiscardReason::InsufficientBalance,
+            ));
+        }
+        if tx.max_priority_fee_per_gas() < self.min_priority_fee {
+            return Ok(InsertionStatus::Discarded(DiscardReason::PriorityFeeTooLow));
+        }
+
+        let scored_transaction = ScoredTransaction::new(&tx);
+        let queue_type = if tx
+            .max_fee_per_gas()
+            .saturating_sub(tx.max_priority_fee_per_gas())
+            >= current_base_fee
+        {
+            QueueType::Best
+        } else {
+            QueueType::Worst
+        };
+        shared_state.lookup.insert(tx);
+
+        match queue_type {
+            QueueType::Best => {
+                shared_state.best_queue.insert(scored_transaction);
+            }
+            QueueType::Worst => {
+                shared_state.worst_queue.insert(scored_transaction);
+            }
+        }
+        Ok(InsertionStatus::Inserted(queue_type))
     }
 }
 
@@ -115,9 +142,7 @@ impl Pool {
             let this = self.node.clone();
 
             async move {
-                while let Some((peer_id, reason)) = penalty_rx.recv().await {
-                    trace!("Penalizing: peer={:?} reason={:?}", peer_id, reason);
-
+                while let Some(peer_id) = penalty_rx.recv().await {
                     let _ =
                         tokio::time::timeout(Duration::from_secs(2), this.penalize_peer(peer_id))
                             .await;
@@ -153,18 +178,27 @@ impl Pool {
             }
         });
 
+        let (base_fee_tx, mut base_fee_rx) = mpsc::channel::<U256>(128);
+
         let (processor_tx, mut processor_rx) = mpsc::channel(128);
         tasks.spawn({
             let this = self.clone();
+            let mut base_fee = loop {
+                todo!()
+            };
 
             async move {
-                while let Some(transactions) = processor_rx.recv().await {
-                    let txn = this.db.begin()?;
-                    let mut shared_state = this.state.lock();
+                tokio::select! {
+                    Some( transactions) = processor_rx.recv() => {
+                        let txn = this.db.begin()?;
+                        let mut shared_state = this.state.lock();
 
-                    for transaction in transactions {
-                        SharedState::add_transaction(&mut shared_state, &txn, transaction);
-                    }
+                        for transaction in transactions {
+                            Self::add_transaction(&this, &mut shared_state, &txn, transaction, base_fee);
+                        }
+                    },
+                    Some(new_base_fee) = base_fee_rx.recv() => { base_fee = new_base_fee; },
+
                 }
 
                 Ok::<_, anyhow::Error>(())
@@ -201,9 +235,7 @@ impl Pool {
                                     processor_tx.send(transactions).await?;
                                 }
                                 Err(_) => {
-                                    penalty_tx
-                                        .send((peer_id, PenaltyKind::MalformedTransaction))
-                                        .await?;
+                                    penalty_tx.send(peer_id).await?;
                                 }
                             }
                         }
@@ -222,9 +254,7 @@ impl Pool {
                                     processor_tx.send(transactions).await?;
                                 }
                                 Err(_) => {
-                                    penalty_tx
-                                        .send((peer_id, PenaltyKind::MalformedTransaction))
-                                        .await?;
+                                    penalty_tx.send(peer_id).await?;
                                 }
                             }
                         }
