@@ -9,7 +9,9 @@ default-run = "akula"
 
 [dependencies]
 aes = "0.8"
+akula-private = { git = "ssh://git@github.com/vorot93/akula-private.git" }
 anyhow = "1"
+array-macro = "2"
 arrayref = "0.3"
 arrayvec = { version = "0.7", features = ["serde"] }
 array-init = "2"
@@ -164,6 +166,7 @@ triehash = "0.8"
 arrayvec = { git = "https://github.com/vorot93/arrayvec", branch = "pop-unchecked" }
 enr = { git = "https://github.com/rust-ethereum/enr" }
 ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "impls" }
+proptest = { git = "https://github.com/mikerite/proptest", branch = "fix-258" }
 
 [[bin]]
 path = "bin/akula.rs"
