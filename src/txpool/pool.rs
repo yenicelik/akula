@@ -1,28 +1,22 @@
 #![allow(unreachable_code)]
 use crate::{
     kv::{mdbx::MdbxTransaction, tables, MdbxWithDirHandle},
-    models::{MessageWithSignature, U256},
+    models::U256,
     p2p::{
         node::Node,
         types::{
             GetPooledTransactions, InboundMessage, Message, NewPooledTransactionHashes, PeerFilter,
-            PenaltyKind, PooledTransactions, Transactions,
+            PooledTransactions, Transactions,
         },
     },
     txpool::{types::*, PoolBuilder},
     TaskGuard,
 };
-use derive_more::Display;
-use mdbx::{EnvironmentKind, TransactionKind, WriteMap, RO};
+use mdbx::{WriteMap, RO};
 use parking_lot::Mutex;
 use rand::Rng;
-use std::{
-    collections::BTreeSet,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use task_group::TaskGroup;
-use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::*;
@@ -43,7 +37,7 @@ pub struct Pool {
 
     state: Arc<Mutex<SharedState>>,
 
-    min_priority_fee: U256,
+    min_miner_fee: U256,
 }
 
 impl Pool {
@@ -76,7 +70,11 @@ impl Pool {
                 DiscardReason::InsufficientBalance,
             ));
         }
-        if tx.max_priority_fee_per_gas() < self.min_priority_fee {
+        let miner_fee = std::cmp::min(
+            tx.max_fee_per_gas().saturating_sub(current_base_fee),
+            tx.max_priority_fee_per_gas(),
+        );
+        if miner_fee < self.min_miner_fee {
             return Ok(InsertionStatus::Discarded(DiscardReason::PriorityFeeTooLow));
         }
 
@@ -178,26 +176,52 @@ impl Pool {
             }
         });
 
-        let (base_fee_tx, mut base_fee_rx) = mpsc::channel::<U256>(128);
+        tasks.spawn({
+            let this = self.clone();
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+
+            async move {
+                loop {
+                    ticker.tick().await;
+
+                    let to_announce = {
+                        let shared_state = this.state.lock();
+                        shared_state
+                            .best_queue
+                            .iter()
+                            .filter_map(|scored_tx| {
+                                shared_state
+                                    .lookup
+                                    .get(scored_tx.hash)
+                                    .map(|tx| (tx.hash, tx.msg.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    if !to_announce.is_empty() {
+                        this.node.announce_transactions(to_announce).await;
+                    }
+                }
+            }
+        });
 
         let (processor_tx, mut processor_rx) = mpsc::channel(128);
         tasks.spawn({
             let this = self.clone();
-            let mut base_fee = loop {
-                todo!()
-            };
+            let base_fee = U256::ZERO;
 
             async move {
                 tokio::select! {
-                    Some( transactions) = processor_rx.recv() => {
+                    Some(transactions) = processor_rx.recv() => {
                         let txn = this.db.begin()?;
                         let mut shared_state = this.state.lock();
 
                         for transaction in transactions {
-                            Self::add_transaction(&this, &mut shared_state, &txn, transaction, base_fee);
+                            Self::add_transaction(&this, &mut shared_state, &txn, transaction, base_fee)
+                                .expect("Failed to add transaction to pool");
                         }
                     },
-                    Some(new_base_fee) = base_fee_rx.recv() => { base_fee = new_base_fee; },
+                    // Some(new_base_fee) = base_fee_rx.recv() => { base_fee = new_base_fee; },
 
                 }
 

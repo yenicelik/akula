@@ -399,6 +399,32 @@ impl Node {
         self.send_raw(data, filter).await.into_iter().next()
     }
 
+    pub async fn announce_transactions(&self, transactions: Vec<(H256, MessageWithSignature)>) {
+        let (hashes, transactions): (Vec<_>, Vec<_>) = transactions.into_iter().unzip();
+
+        let data = grpc_sentry::OutboundMessageData {
+            id: grpc_sentry::MessageId::from(MessageId::NewPooledTransactionHashes) as i32,
+            data: || -> bytes::Bytes {
+                let mut buf = BytesMut::new();
+                NewPooledTransactionHashes(hashes).encode(&mut buf);
+                buf.freeze()
+            }(),
+        };
+        self.send_raw(data, PeerFilter::All).await;
+
+        let data = grpc_sentry::OutboundMessageData {
+            id: grpc_sentry::MessageId::from(MessageId::Transactions) as i32,
+            data: || -> bytes::Bytes {
+                let mut buf = BytesMut::new();
+                Transactions(transactions).encode(&mut buf);
+                buf.freeze()
+            }(),
+        };
+        let pred = PeerFilter::Random(self.sqrt_peers().await as u64);
+
+        self.send_raw(data, pred).await;
+    }
+
     pub async fn send_pooled_transactions(
         &self,
         request_id: RequestId,
@@ -407,7 +433,7 @@ impl Node {
     ) -> HashSet<(SentryId, PeerId)> {
         let data = grpc_sentry::OutboundMessageData {
             id: grpc_sentry::MessageId::from(MessageId::PooledTransactions) as i32,
-            data: |transactions: Vec<MessageWithSignature>| -> bytes::Bytes {
+            data: || -> bytes::Bytes {
                 let mut buf = BytesMut::new();
                 PooledTransactions {
                     request_id,
@@ -415,7 +441,7 @@ impl Node {
                 }
                 .encode(&mut buf);
                 buf.freeze()
-            }(transactions),
+            }(),
         };
         self.send_raw(data, pred).await
     }
